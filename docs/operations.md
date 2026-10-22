@@ -129,3 +129,131 @@ The telemetry sink exposes:
 `watchtower doctor` does not require telemetry to be configured; the
 no-op default keeps the service fully functional without a logger
 attached.
+
+## Session progress reports
+
+Run `watchtower report --session ID --output ./report.html`, or use `--log` for an
+explicit rollout. With neither option the command lists sessions and asks for a
+number; noninteractive execution requires a source. The report command can run
+without a config file. If supplied, `--config` uses the standard Watchtower TOML.
+`--interval` accepts 300–600 seconds; `--model` defaults to `gpt-6-luna`.
+
+By default the server binds to `127.0.0.1:0`, keeps that socket, and prints the actual URL
+after startup. It serves `/`, `/report.json`, and `/events`, not the rollout or a
+file directory. Reconnecting SSE clients receive the current full snapshot.
+`report.html` is atomically replaced with mode 0600. Open it as a file for an offline
+snapshot; it performs no network requests under `file://`.
+
+For a permanent local nginx URL, run the report with `--port 18765` and include
+`deploy/codex-watchtower-report.nginx.conf` inside nginx's `http` block. This serves
+`http://127.0.0.1/codex-watchtower/`; the URL without a trailing slash redirects to
+it. Client API and SSE URLs are relative to the page. nginx strips the prefix and
+disables buffering for streaming updates. The backend remains bound to loopback.
+Validate with `nginx -t` before reloading. Run the report under systemd with
+`Restart=on-failure`, enable it for boot, and keep config, HTML and state outside
+`/tmp`. Supply the user's HOME and a PATH containing both Codex CLI and Node.
+Set `KillSignal=SIGINT`, `KillMode=mixed` and `TimeoutStopSec=15` on the report
+unit. This signals the main process first so it cancels its model subprocess
+without recording a CLI failure. The default `control-group` mode also signals
+Codex immediately, which can store a false failure and delay the next analysis.
+
+The live header searches `/sessions?q=...` by folder, ID and title, with a 15-second
+catalog cache and at most 20 results. Only sessions started within the last seven
+days appear; modifying an old journal does not make it recent. Only root user
+sessions from CLI, VS Code or exec are listed; Guardian, subagent and service
+sessions are excluded using source, thread source and parent metadata. Codex's local thread
+index supplies renamed titles, with the first user message as fallback. The picker
+is hidden in offline files. `POST /session` accepts only an opaque catalog key;
+arbitrary paths and foreign origins are rejected. Selection cancels the previous
+analysis before starting the next and restores each source's saved state. Selection
+is shared by all tabs. Aging out of search does not close the current report.
+
+`POST /settings` accepts a strict `{"fast": true|false}` JSON object and rejects
+foreign origins. The header checkbox saves this shared setting atomically in
+`state_dir/progress/report-settings.json`; it applies to the next model call.
+Fast passes `service_tier="fast"`, without changing the model or reasoning.
+
+The operational report uses the last five minutes ending at the latest session
+event, even for an idle session. Its cursor and errors are separate from the first
+full history pass. The scheduler prioritizes operational updates every configured
+interval, then resumes history batches; after that full pass completes, it runs
+only window updates. Each call is cancelled after 60 seconds including CLI startup,
+and its process group is killed. A full pass may take many batches. Window omissions
+are explicit in `window_coverage` and the coverage disclosure. Recent journal
+messages remain visible immediately; historical model output cannot block them.
+
+Ingestion reads at most 200 records per tick so initial history does not block the
+HTTP server. Initial catch-up coverage is explicitly marked until the startup file
+boundary has been read and analyzed.
+The header reads structured, session-matching Codex goal results from ingested
+events independently of the model cursor. A reported completed goal can therefore
+appear while historical analysis continues. Goal completion is Codex-reported,
+not an independent acceptance check or process-exit signal. Prose and statuses for
+other sessions do not set this indicator. Turn lifecycle events also drive the
+session activity indicator. A new turn starting after completion makes that goal
+historical; its closing event alone does not. The page shows work while the new
+turn is active, then turn completion, independently of the older goal status.
+Without goal or turn evidence, the status is unknown. Stale task lists and
+estimates stay under historical
+disclosures; only a fully caught-up assessment is presented as current work.
+
+The state directory is `state_dir/progress/`. Each absolute source path has a hashed
+database name and an advisory lock preventing two report processes from observing
+the same source simultaneously. SQLite stores read checkpoints, a separate analyzed
+cursor, initial catch-up boundary, attempt time, errors and report versions. Tasks
+and chart history are derived from those persisted versions. Do not remove this
+state while the process is running. `serve` uses a separate database and cursor.
+
+Recovery behavior:
+
+- No new events: the model is not called; the page shows the last observation time.
+- Model error, invalid schema/evidence, quota exhaustion or 180-second timeout: keep
+  the previous report and analyzed cursor, display an error, retry after the interval.
+- Export failure: keep the existing HTML and show an export error on the live page.
+- Broken SSE: retain the displayed report and reconnect automatically.
+- Partial final JSONL line: wait for its terminating newline.
+- Replacement preserving the verified prefix: continue without duplicate events.
+- Changed/truncated prefix: stop analyzing that source and display a source error.
+  Restore the original append-only prefix or select the correct rollout; do not
+  delete state to pretend the broken history was verified.
+- Resume after a finished turn: reopen the observed work and retain task/history IDs.
+  Transcript turn completion is not independent process-exit evidence.
+
+### Codex compatibility and isolation
+
+Install/authenticate Codex CLI 0.163.0 and ensure `codex` is in PATH. A different
+version fails closed. The subprocess ignores user configuration (including custom
+model providers), rules and workspace instructions; it uses saved default-provider
+authentication. It runs in an empty temporary directory with shell, patch, image,
+browser, multi-agent, sleep, apps, remote plugins, hooks, memories and goals disabled.
+No MCP configuration is inherited. A read-only sandbox is an additional boundary,
+not the mechanism that disables tools. The output schema limits reference IDs to
+events actually present in the observation packet; the application validates again.
+
+Before changing the accepted CLI version or disabled feature set, run this opt-in
+probe with loopback binding allowed:
+
+```bash
+WATCHTOWER_PROBE_CODEX=1 uv run pytest tests/integration/test_codex_isolation.py -q
+```
+
+The probe sends synthetic input to a local mock Responses endpoint, captures the
+actual CLI request and asserts that `tools` is empty. It makes no inference request
+to a real model provider. Update the version guard only after this check passes.
+
+The normal test suite includes a real HTTP/CLI/SSE/export/shutdown integration test
+with an offline Codex stub. Run the suite in an environment permitting loopback
+sockets and Python thread wakeups; a restrictive network sandbox can hang the
+existing synchronous Starlette TestClient. Keep a finite outer test timeout.
+
+### Limits of the report
+
+Packets are limited to 48,000 characters; generated reports to 24,000 characters,
+40 retained tasks, and a 128 KB raw model response. Long initial histories are
+summarized sequentially. Missing, encrypted, unknown and truncated evidence is
+visible as incomplete coverage. No independent repository/CI/deployment verification
+is performed. Model estimates may move backward when scope or evidence changes.
+Sensitive prose can survive pattern-based redaction; select only sessions you are
+comfortable sending to the default Codex provider. No raw provider stderr is exposed
+in the report. Initial catch-up may require several model calls; routine calls only
+happen after new events.

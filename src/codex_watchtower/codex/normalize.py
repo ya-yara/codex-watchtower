@@ -10,23 +10,22 @@ event id, and what an assessment's evidence references resolve against.
 start of the session file (spec 5.2); it is supplied by the tailer, not
 computed here.
 
-The exact rollout JSONL envelope (``{"type": ..., "payload": {...}}``) has
-not been captured live in this environment -- see
-spikes/codex-lifecycle/README.md. Any ``type`` this module does not
-recognize normalizes to ``kind=unknown`` rather than raising, which is the
-actual robustness requirement (spec 4.1: "Unknown Codex event types must be
-preserved and must not crash ingestion") and is what protects this module
-against the envelope shape being wrong in some detail.
+Legacy flattened records and the persisted response_item/event_msg envelopes
+are both supported. Current envelope shapes were inspected in Codex 0.163.0
+rollouts; the committed fixture replaces their contents with synthetic data.
+Unknown types remain visible as bounded unknown events rather than crashing ingestion.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from codex_watchtower import domain
+from codex_watchtower.codex.goal import reported_goal
 from codex_watchtower.codex.tailer import RawRecord
 from codex_watchtower.privacy.redact import bound_text, redact_text
 
@@ -36,7 +35,7 @@ MAX_PATH_CHARS = 512
 
 # session_meta is session-level metadata consumed by discovery.py; it is not
 # part of the normalized event stream and produces no WatchtowerEvent.
-_IGNORED_TYPES = {"session_meta"}
+_IGNORED_TYPES = {"session_meta", "turn_context", "token_usage_record", "world_state"}
 
 _KNOWN_TYPES: dict[str, domain.EventKind] = {
     "turn_started": domain.EventKind.turn_lifecycle,
@@ -78,7 +77,9 @@ def _optional_str_field(payload: dict[str, Any], key: str) -> str | None:
 def _valid_timestamp(ts: str, fallback: str) -> str:
     """Return ts if it parses as RFC 3339, otherwise the fallback."""
     try:
-        datetime.fromisoformat(ts[:-1] + "+00:00" if ts.endswith("Z") else ts)
+        parsed = datetime.fromisoformat(ts[:-1] + "+00:00" if ts.endswith("Z") else ts)
+        if parsed.tzinfo is None or len(ts) > 40:
+            return fallback
         return ts
     except (ValueError, IndexError):
         return fallback
@@ -121,7 +122,7 @@ def normalize_record(
         )
 
     raw_type = record.parsed.get("type")
-    if raw_type in _IGNORED_TYPES:
+    if isinstance(raw_type, str) and raw_type in _IGNORED_TYPES:
         return None
 
     payload_any = record.parsed.get("payload")
@@ -129,6 +130,9 @@ def normalize_record(
     timestamp = _valid_timestamp(
         _optional_str_field(record.parsed, "timestamp") or "", fallback_timestamp
     )
+
+    if isinstance(raw_type, str) and raw_type in {"response_item", "event_msg", "compacted"}:
+        return _normalize_envelope(session_id, record, payload, timestamp, payload_hash)
 
     kind = _KNOWN_TYPES.get(raw_type) if isinstance(raw_type, str) else None
     source_type = raw_type if isinstance(raw_type, str) else None
@@ -216,3 +220,103 @@ def _build(
         source_type=source_type,
     )
     return NormalizedRecord(event=event, payload_hash=payload_hash)
+
+
+def _normalize_envelope(
+    session_id: str, record: RawRecord, payload: dict[str, Any], timestamp: str, payload_hash: str
+) -> NormalizedRecord | None:
+    """Unwrap persisted CLI events; encrypted compaction content is never evidence."""
+    envelope = str((record.parsed or {}).get("type"))
+    subtype = str(payload.get("type", envelope))
+    kind = domain.EventKind.unknown
+    source = f"{envelope}:{subtype}"[:128]
+    exit_code = None
+    if envelope == "compacted" or subtype == "compaction":
+        text = "Compaction boundary; encrypted or omitted history is unavailable."
+    elif envelope == "response_item":
+        if subtype == "message":
+            kind = domain.EventKind.message
+            source = str(payload.get("role", "unknown"))[:128]
+            content = payload.get("content", [])
+            text = (
+                "\n".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+                if isinstance(content, list)
+                else str(content)
+            )
+        elif subtype in {"function_call", "custom_tool_call"}:
+            kind = domain.EventKind.command
+            text = f"{payload.get('name')} [{payload.get('call_id')}]: " + str(
+                payload.get("arguments", payload.get("input", ""))
+            )
+        elif subtype in {"function_call_output", "custom_tool_call_output"}:
+            kind = domain.EventKind.command_result
+            text = f"Result [{payload.get('call_id')}]: " + json.dumps(
+                payload.get("output"), ensure_ascii=False
+            )
+            if goal := reported_goal(payload.get("output"), session_id):
+                source = "goal_status"
+                # Preserve status even when the surrounding tool result exceeds the excerpt budget.
+                text = json.dumps(
+                    {
+                        "goal": {"threadId": session_id, **goal},
+                        "call_id": payload.get("call_id"),
+                        "note": "Surrounding tool output omitted. [TRUNCATED event excerpt]",
+                    }
+                )
+        elif subtype == "reasoning":
+            kind = domain.EventKind.reasoning
+            text = json.dumps(payload.get("summary", []), ensure_ascii=False)
+        else:
+            text = f"Unknown response item: {subtype}"
+    elif subtype in {"task_started", "task_complete", "turn_aborted"}:
+        kind = domain.EventKind.turn_lifecycle
+        source = "turn_started" if subtype == "task_started" else "turn_complete"
+        text = f"{subtype}: {payload.get('last_agent_message', '')}"
+    elif subtype in {"token_count", "thread_settings_applied"}:
+        return None
+    elif subtype == "item_completed":
+        item = payload.get("item", {})
+        if not isinstance(item, dict):
+            item = {}
+        item_type = str(item.get("type"))
+        # Messages are also persisted as response_items; avoid duplicate prose.
+        if item_type in {"UserMessage", "AgentMessage", "Reasoning"}:
+            return None
+        if item_type == "CommandExecution":
+            kind = domain.EventKind.command_result
+            source = "shell"
+            code = item.get("exit_code")
+            exit_code = code if isinstance(code, int) and not isinstance(code, bool) else None
+            if exit_code is not None and not -256 <= exit_code <= 65535:
+                exit_code = None
+            text = (
+                f"$ {item.get('command')} -> exit {exit_code}: {item.get('aggregated_output', '')}"
+            )
+        elif item_type == "FileChange":
+            kind = domain.EventKind.file_changed
+            text = json.dumps(item.get("changes", {}), ensure_ascii=False)
+        elif item_type in {"Plan", "plan"}:
+            kind = domain.EventKind.message
+            source = "plan"
+            text = json.dumps(item, ensure_ascii=False)
+        else:
+            text = f"Unknown completed item: {item_type}"
+    elif subtype in {"agent_message", "user_message"}:
+        kind = domain.EventKind.message
+        source = "user" if subtype == "user_message" else "assistant"
+        text = str(payload.get("message", ""))
+    else:
+        text = f"Unrecognized event: {subtype}"
+    redacted = redact_text(text).text
+    if len(redacted) > MAX_SUMMARY_CHARS:
+        redacted = redacted[: MAX_SUMMARY_CHARS - 30] + "\n[TRUNCATED event excerpt]"
+    return _build(
+        session_id=session_id,
+        record_ordinal=record.record_ordinal,
+        payload_hash=payload_hash,
+        kind=kind,
+        timestamp=timestamp,
+        summary=redacted,
+        source_type=source,
+        exit_code=exit_code,
+    )
